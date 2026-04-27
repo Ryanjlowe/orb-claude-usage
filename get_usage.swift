@@ -1,60 +1,99 @@
-// Usage: swiftc get_usage.swift -o get_usage
-//        ./get_usage <path-to-image>
+// Captures the Claude desktop window, runs Vision OCR, and prints the
+// "Current session" usage percentage as a plain integer (e.g. "54").
 //
-// Runs Vision OCR on the given image, finds the "Current session" block,
-// and prints the usage percentage as a plain integer (e.g. "54").
-// Exits 1 with a message on stderr if not found.
+// Compile:
+//   swiftc get_usage.swift -o get_usage
+//
+// On first run macOS will prompt for Screen Recording permission.
+// Grant it in: System Settings → Privacy & Security → Screen Recording
 
 import Cocoa
 import Vision
+import ScreenCaptureKit
 
-guard CommandLine.arguments.count > 1 else {
-    fputs("Usage: get_usage <image-path>\n", stderr)
-    exit(1)
-}
+// ── helpers ──────────────────────────────────────────────────────────────────
 
-let imagePath = CommandLine.arguments[1]
-let imageURL = URL(fileURLWithPath: imagePath)
+func fail(_ msg: String) -> Never { fputs(msg + "\n", stderr); exit(1) }
 
-guard let nsImage = NSImage(contentsOf: imageURL),
-      let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-    fputs("Error: could not load image at \(imagePath)\n", stderr)
-    exit(1)
-}
-
-var lines: [String] = []
-let semaphore = DispatchSemaphore(value: 0)
-
-let request = VNRecognizeTextRequest { req, _ in
-    defer { semaphore.signal() }
-    guard let obs = req.results as? [VNRecognizedTextObservation] else { return }
-    lines = obs.compactMap { $0.topCandidates(1).first?.string }
-}
-request.recognitionLevel = .accurate
-request.usesLanguageCorrection = false
-
-let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-try? handler.perform([request])
-semaphore.wait()
-
-// Vision reads left column then right column, so "63% used" may be many lines
-// after "Current session". Strategy: once we've seen "Current session", grab
-// the first "X% used" that appears anywhere after it in the OCR output.
-var seenCurrentSession = false
-for line in lines {
-    if line.lowercased().contains("current session") {
-        seenCurrentSession = true
-        continue
-    }
-    if seenCurrentSession,
-       let match = line.range(of: #"(\d{1,3})%\s*used"#, options: .regularExpression) {
-        let token = line[match]
-        if let numMatch = token.range(of: #"\d{1,3}"#, options: .regularExpression) {
-            print(token[numMatch])
-            exit(0)
+func parsePercent(from lines: [String]) -> Int? {
+    var seenSession = false
+    for line in lines {
+        if line.lowercased().contains("current session") { seenSession = true; continue }
+        if seenSession,
+           let m = line.range(of: #"(\d{1,3})%\s*used"#, options: .regularExpression),
+           let n = line[m].range(of: #"\d{1,3}"#, options: .regularExpression) {
+            return Int(line[m][n])
         }
     }
+    return nil
 }
 
-fputs("Not found: open Claude → Settings → Usage so the page is visible.\n", stderr)
-exit(1)
+func ocrLines(from image: CGImage) -> [String] {
+    var out: [String] = []
+    let sem = DispatchSemaphore(value: 0)
+    let req = VNRecognizeTextRequest { r, _ in
+        out = (r.results as? [VNRecognizedTextObservation] ?? [])
+            .compactMap { $0.topCandidates(1).first?.string }
+        sem.signal()
+    }
+    req.recognitionLevel = .accurate
+    req.usesLanguageCorrection = false
+    try? VNImageRequestHandler(cgImage: image, options: [:]).perform([req])
+    sem.wait()
+    return out
+}
+
+// ── entry point ───────────────────────────────────────────────────────────────
+
+// NSApplication.shared initialises the Cocoa/CGS stack required by SCKit
+let app = NSApplication.shared
+app.setActivationPolicy(.prohibited)
+
+let sem = DispatchSemaphore(value: 0)
+
+Task {
+    defer { sem.signal() }
+
+    // 1. Get shareable content (triggers permission prompt on first run)
+    let content: SCShareableContent
+    do {
+        content = try await SCShareableContent.excludingDesktopWindows(false,
+                                                                       onScreenWindowsOnly: true)
+    } catch {
+        fail("Screen Recording permission denied.\n" +
+             "Grant it in System Settings → Privacy & Security → Screen Recording,\n" +
+             "then re-run this command.")
+    }
+
+    // 2. Find Claude window
+    guard let win = content.windows.first(where: {
+        $0.owningApplication?.applicationName == "Claude" && $0.isOnScreen
+    }) else {
+        fail("Claude window not found — is the app running with Settings → Usage visible?")
+    }
+
+    // 3. Capture
+    let filter = SCContentFilter(desktopIndependentWindow: win)
+    let cfg = SCStreamConfiguration()
+    cfg.width   = Int(win.frame.width  * 2)
+    cfg.height  = Int(win.frame.height * 2)
+    cfg.showsCursor = false
+
+    let image: CGImage
+    do {
+        image = try await SCScreenshotManager.captureImage(contentFilter: filter,
+                                                           configuration: cfg)
+    } catch {
+        fail("Capture failed: \(error.localizedDescription)")
+    }
+
+    // 4. OCR → parse
+    let lines = ocrLines(from: image)
+    guard let pct = parsePercent(from: lines) else {
+        fail("Could not find usage % — navigate to Claude Settings → Usage.")
+    }
+    print(pct)
+    exit(0)
+}
+
+sem.wait()
